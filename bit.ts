@@ -21,7 +21,7 @@ const globalUtxoSet = slpUtxos();
 import { PruneStack } from './prunestack';
 import { TokenFilters } from './filters';
 
-import { GrpcClient } from 'grpc-bchrpc-node';
+import { BlockInfo, GrpcClient } from 'grpc-bchrpc-node';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const slpLokadIdHex = "534c5000";
@@ -261,6 +261,95 @@ export class Bit {
             console.log('[INFO] BCH mempool txn count:', (await RpcClient.getRawMemPool()).length);
             console.log("[INFO] SLP mempool txn count:", this.slpMempool.size);
         }
+    }
+
+    async crawlBlock(blockIndex: number, blockHashBuf: Buffer) {
+        let blockContent = await RpcClient.getBlockInfo({ index: blockIndex });
+        const blockHash = blockContent.hash;
+        const blockTime = blockContent.time;
+
+        console.log('[INFO] Crawling block', blockIndex, 'hash:', blockHash);
+        const blockHex = <string>await RpcClient.getRawBlock(blockContent.hash);
+        const block = Block.fromReader(new BufferReader(Buffer.from(blockHex, 'hex')));
+
+        console.time(`Toposort-${blockIndex}`);
+        const blockTxCache = new Map<string, { deserialized: bitcore.Transaction, serialized: Buffer}>();
+        const spentOutpoints: [string,Uint8Array][] = [];
+        console.log(`[DEBUG] Block ${blockContent.hash} has ${block.txs.length} txns`);
+        block.txs.forEach((t: any, i: number) => {
+            const serialized: Buffer = t.toRaw();
+            const hash = t.hash().reverse();
+            for (let input of t.inputs) {
+                spentOutpoints.push([input.prevout.hash.reverse().toString("hex")+":"+input.prevout.index, hash]);
+            }
+            let res = this.applySlpTxnFilter(serialized);
+            if (res) {
+                // @ts-ignore
+                const deserialized = res.txn;
+                const txid = deserialized.hash;
+                blockTxCache.set(txid, {deserialized, serialized});
+                RpcClient.transactionCache.set(txid, serialized);
+                deserialized.inputs.forEach((input) => {
+                    let prevOutpoint = input.prevTxId.toString("hex") + ":" + input.outputIndex;
+                    this._spentTxoCache.set(prevOutpoint, { txid, block: blockIndex });  // TODO: update to only cache slp outpoints?
+                    console.log(`[INFO] _spentTxoCache.set ${prevOutpoint} -> ${txid} at ${blockIndex}`);
+                    // TODO: Scan for SLP token burns elsewhere... for all block transactoins (is this being done already somewhere else?)
+                });
+            }
+        });
+        let stack: string[] = [];
+        await this.topologicalSort(blockTxCache, stack);
+        if (stack.length !== blockTxCache.size) {
+            throw Error("Transaction count is incorrect after topological sorting.");
+        }
+        console.timeEnd(`Toposort-${blockIndex}`);
+
+        for (let i = 0; i < stack.length; i++) {
+            let txid = stack[i];
+            const deserialized = blockTxCache.get(txid)!.deserialized;
+
+            let t: TNATxn = tna.fromTx(deserialized, { network: this.network });
+            let slp = await this.setSlpProp(deserialized, blockTime, t, blockIndex, null);
+
+            t.blk = {
+                h: blockHash,
+                i: blockIndex,
+                t: blockTime
+            };
+
+            if (slp.detail && slp.detail.tokenIdHex) {
+                await this.db.confirmedReplace([t], blockIndex);
+                if (t.slp?.valid) {
+                    this._tokenIdsModified.add(slp.detail.tokenIdHex);
+                    let graph = await this._slpGraphManager.getTokenGraph({ txid, tokenIdHex: slp.detail.tokenIdHex });
+                    if (graph) {
+                        await graph!.addGraphTransaction({ txid, processUpToBlock: blockIndex, blockHash: blockHashBuf});
+                    }
+                }
+            }
+        }
+        // search for SLP output burns in non-SLP or invalid SLP transactions
+        for (let [txo, spentIn] of spentOutpoints) {
+            if (globalUtxoSet.has(txo)) {
+                let tokenIdHex = globalUtxoSet.get(txo)!.toString("hex");
+                let graph = (await this._slpGraphManager.getTokenGraph({ txid: tokenIdHex, tokenIdHex }))!;
+                let updated = graph.markInvalidSlpOutputAsBurned(txo, Buffer.from(spentIn).toString("hex"), blockIndex);
+                if (updated) {
+                    this._tokenIdsModified.add(tokenIdHex);
+                }
+                globalUtxoSet.delete(txo);
+            }
+        }
+            
+        for (let tokenId of this._tokenIdsModified) {
+            let graph = (await this._slpGraphManager.getTokenGraph({ txid: tokenId, tokenIdHex: tokenId }))!;
+            if (graph) {
+                await graph.commitToDb();
+            }
+        }
+        this._tokenIdsModified.clear();
+
+        console.log(`[INFO] Block ${blockIndex} processed : ${block.txs.length} BCH tx | ${stack.length} SLP tx`);
     }
 
     async crawl(blockIndex: number, syncComplete?: boolean): Promise<[CrawlResult, [string,Uint8Array][]]> {
@@ -592,21 +681,6 @@ export class Bit {
                 }
 
                 console.time('[PERF] RPC END ' + index);
-                let syncComplete = zmqHash ? true : false;
-                let crawledTxns: CrawlResult; 
-                let spentOutpoints: [string, Uint8Array][];
-                try {
-                    [ crawledTxns, spentOutpoints ] = (await self.crawl(index, syncComplete)) as [CrawlResult, [string,Uint8Array][]];
-                } catch (err) {
-                    if (!zmqHash) {
-                        throw err;
-                    }
-                    return null;
-                } finally {
-                    console.timeEnd('[PERF] RPC END ' + index);
-                    console.time('[PERF] DB Insert ' + index);
-                }
-
                 let blockHash: Buffer;
                 try {
                     blockHash = (await RpcClient.getBlockHash(index, true)) as Buffer;
@@ -616,45 +690,18 @@ export class Bit {
                     }
                     return null;
                 }
-        
-                if (crawledTxns && crawledTxns.size > 0) {
-                    let array = Array.from(crawledTxns.values()).map(c => c.tnaTxn);
-                    await self.db.confirmedReplace(array, index);
 
-                    for (let [txid, v] of crawledTxns) {
-                        if (v.tnaTxn.slp?.valid) {
-                            self._tokenIdsModified.add(v.tokenId);
-                            let graph = await self._slpGraphManager.getTokenGraph({ txid, tokenIdHex: v.tokenId });
-                            if (graph) {
-                                await graph!.addGraphTransaction({ txid, processUpToBlock: index, blockHash });
-                            }
-                            // for (let input of v.tnaTxn.in) {
-                            //     globalUtxoSet.delete(`${(input.e as Sender).h}:${(input.e as Sender).i}`);
-                            // }
-                        }
+                try {
+                    await self.crawlBlock(index, blockHash);
+                } catch (err) {
+                    if (!zmqHash) {
+                        throw err;
                     }
+                    return null;
+                } finally {
+                    console.timeEnd('[PERF] RPC END ' + index);
+                    console.time('[PERF] DB Insert ' + index);
                 }
-
-                // search for SLP output burns in non-SLP or invalid SLP transactions
-                console.time(`burnSearch-${index}`);
-                for (let [txo, spentIn] of spentOutpoints) {
-                    if (globalUtxoSet.has(txo)) {
-                        let tokenIdHex = globalUtxoSet.get(txo)!.toString("hex");
-                        let graph = (await self._slpGraphManager.getTokenGraph({ txid: tokenIdHex, tokenIdHex }))!;
-                        let updated = graph.markInvalidSlpOutputAsBurned(txo, Buffer.from(spentIn).toString("hex"), index);
-                        if (updated) {
-                            self._tokenIdsModified.add(tokenIdHex);
-                        }
-                        globalUtxoSet.delete(txo);
-                    }
-                }
-                console.timeEnd(`burnSearch-${index}`);
-
-                for (let tokenId of self._tokenIdsModified) {
-                    let graph = (await self._slpGraphManager.getTokenGraph({ txid: tokenId, tokenIdHex: tokenId }))!;
-                    await graph.commitToDb();
-                }
-                self._tokenIdsModified.clear();
 
                 if (index - 100 > 0) {
                     await Info.deleteBlockCheckpointHash(index - 100);

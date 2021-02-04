@@ -6,7 +6,7 @@ import { TNATxnSlpDetails } from "./tna";
 import { TokenDBObject } from "./interfaces";
 import { CacheMap } from "./cache";
 
-const bitqueryd = require('fountainhead-core').slpqueryd
+const bitqueryd = require('fountainhead-core-opt').slpqueryd
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const MAX_QUERY_LIMIT = 10000000;  // this is just set to a very high number
